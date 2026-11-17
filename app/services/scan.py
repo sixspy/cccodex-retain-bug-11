@@ -2,6 +2,7 @@ from datetime import date, datetime
 
 import sqlite3
 
+from app.services.images import image_state, shadow_partition_ids
 from app.services.policies import get_active_policy
 
 
@@ -20,11 +21,17 @@ def run_expire_scan(conn: sqlite3.Connection, as_of_date: str) -> dict:
     expired = 0
 
     online = conn.execute(
-        "SELECT id, domain_code, biz_date, storage_state FROM partitions "
+        "SELECT id, domain_code, biz_date, storage_state, archive_uri FROM partitions "
         "WHERE storage_state = '在线'"
     ).fetchall()
+    shadows = shadow_partition_ids(conn)
 
     for part in online:
+        # 双影专拦：在线却仍带归档痕迹的分区不开新裁决，
+        # 否则同一分区会被再次判到期，回灌双影会叠成「入库双影 + 重复裁决」。
+        image = image_state(dict(part), has_shadow=part["id"] in shadows)
+        if image["dual"]:
+            continue
         policy = get_active_policy(conn, part["domain_code"])
         if not policy:
             continue

@@ -8,10 +8,15 @@ from app.main import app
 
 
 @pytest.fixture()
-def client(tmp_path):
+def db_path(tmp_path):
     db = tmp_path / "test.db"
     os.environ["DATABASE_PATH"] = str(db)
     init_db(str(db))
+    return str(db)
+
+
+@pytest.fixture()
+def client(db_path):
     with TestClient(app) as c:
         yield c
 

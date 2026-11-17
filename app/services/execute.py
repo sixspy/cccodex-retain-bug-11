@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.services.images import image_state, shadow_marker
 from app.services.partitions import get_partition
 
 
@@ -19,6 +20,14 @@ def execute_judgment(conn: sqlite3.Connection, judgment_id: int) -> dict:
         raise ValueError("分区不存在")
     if part["storage_state"] not in ("在线", "裁撤中"):
         raise ValueError(f"分区状态不可裁撤：{part['storage_state']}")
+    # 双影专拦：分区同时带在线与归档映像时不再叠一次裁撤，
+    # 否则执行流水与库内状态会继续分叉，对账无法收敛。
+    image = image_state(part, has_shadow=shadow_marker(conn, part["id"]) is not None)
+    if image["dual"]:
+        raise ValueError(
+            "双影分区不可执行：" + "、".join(image["reasons"])
+            + "；请先归一回灌单态"
+        )
 
     conn.execute(
         "UPDATE judgments SET status = '执行中', fail_reason = '' WHERE id = ?",

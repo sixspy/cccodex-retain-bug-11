@@ -7,7 +7,12 @@ from itsdangerous import BadSignature, URLSafeSerializer
 
 from app.config import Config
 from app.db import get_db, init_db
-from app.services.reinject import reinject_partition
+from app.services.reinject import (
+    ReinjectError,
+    get_partition_detail,
+    list_reinject_runs,
+    reinject_partition,
+)
 from app.services import (
     execute_judgment,
     list_judgments,
@@ -16,8 +21,10 @@ from app.services import (
     list_reports,
     list_runs,
     list_scan_jobs,
+    reconcile_queue,
     run_expire_scan,
     run_reconcile,
+    scan_images,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,10 +119,43 @@ def api_policies(request: Request):
 
 
 @app.get("/api/partitions")
-def api_partitions(request: Request, domain_code: str | None = None):
+def api_partitions(
+    request: Request,
+    domain_code: str | None = None,
+    storage_state: str | None = None,
+):
     require_user(request)
     with get_db() as conn:
-        return {"items": list_partitions(conn, domain_code=domain_code)}
+        return {
+            "items": list_partitions(
+                conn, domain_code=domain_code, storage_state=storage_state
+            )
+        }
+
+
+@app.get("/api/partitions/images/duals")
+def api_dual_images(request: Request):
+    require_user(request)
+    with get_db() as conn:
+        items = [p for p in scan_images(conn) if p["image"]["dual"]]
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/partitions/{partition_id}")
+def api_partition_detail(request: Request, partition_id: int):
+    require_user(request)
+    with get_db() as conn:
+        item = get_partition_detail(conn, partition_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="分区不存在")
+    return {"item": item}
+
+
+@app.get("/api/reinject-runs")
+def api_reinject_runs(request: Request):
+    require_user(request)
+    with get_db() as conn:
+        return {"items": list_reinject_runs(conn)}
 
 
 @app.get("/api/scan-jobs")
@@ -169,6 +209,13 @@ def api_reports(request: Request):
         return {"items": list_reports(conn)}
 
 
+@app.get("/api/reconcile-queue")
+def api_reconcile_queue(request: Request):
+    require_user(request)
+    with get_db() as conn:
+        return reconcile_queue(conn)
+
+
 @app.post("/api/reconcile-reports")
 async def api_reconcile(request: Request):
     require_user(request)
@@ -182,11 +229,34 @@ async def api_reconcile(request: Request):
 
 
 @app.post("/api/partitions/{partition_id}/reinject")
-def api_reinject(request: Request, partition_id: int):
+async def api_reinject(request: Request, partition_id: int):
     require_user(request)
+    body: dict = {}
+    if request.headers.get("content-length"):
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — 允许空 body 走默认路径
+            body = {}
+    mode = str(body.get("mode") or "对照临时副本").strip()
+    allow_dual_repair = bool(body.get("allow_dual_repair", False))
     try:
         with get_db() as conn:
-            part = reinject_partition(conn, partition_id)
+            part = reinject_partition(
+                conn,
+                partition_id,
+                mode=mode,
+                allow_dual_repair=allow_dual_repair,
+            )
+    except ReinjectError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": exc.code,
+                "error": str(exc),
+                "detail": str(exc),
+            },
+            status_code=409,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "item": part}

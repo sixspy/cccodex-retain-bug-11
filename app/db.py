@@ -8,9 +8,12 @@ from app.config import Config
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or Config.database()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 回灌的写入锁与并发补跑都落在同一个库文件上：给写者留出排队时间，
+    # 拿不到锁的那一路会先等锁再判定，而不是静默双写。
+    conn.execute("PRAGMA busy_timeout = 8000")
     return conn
 
 
@@ -98,8 +101,33 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   destroyed_count INTEGER NOT NULL,
   pending_judgment_count INTEGER NOT NULL,
   mismatch_count INTEGER NOT NULL,
+  dual_count INTEGER NOT NULL DEFAULT 0,
   summary TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS reinject_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  partition_id INTEGER NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('对照临时副本','直接升主轨')),
+  target_state TEXT NOT NULL,
+  snapshot_state TEXT NOT NULL,
+  snapshot_archive_uri TEXT,
+  snapshot_row_count INTEGER NOT NULL,
+  previous_state TEXT NOT NULL,
+  previous_archive_uri TEXT,
+  precheck TEXT NOT NULL DEFAULT '',
+  ok INTEGER NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(partition_id) REFERENCES partitions(id)
+);
+
+CREATE TABLE IF NOT EXISTS reinject_locks (
+  partition_id INTEGER PRIMARY KEY,
+  owner TEXT NOT NULL,
+  acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -132,9 +160,30 @@ SEED_PARTITIONS = [
 ]
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给旧库补列/补索引：CREATE TABLE IF NOT EXISTS 不会改动已存在的表。"""
+    report_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(reconcile_reports)").fetchall()
+    }
+    if "dual_count" not in report_cols:
+        conn.execute(
+            "ALTER TABLE reconcile_reports "
+            "ADD COLUMN dual_count INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_judgments_partition "
+        "ON judgments(partition_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_partitions_state "
+        "ON partitions(storage_state)"
+    )
+
+
 def init_db(db_path: str | None = None) -> None:
     with get_db(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM retain_policies").fetchone()["c"]
         if n == 0:
             for domain_code, domain_name, keep_days, action in SEED_POLICIES:
